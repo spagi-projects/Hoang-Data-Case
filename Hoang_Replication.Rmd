@@ -1,0 +1,222 @@
+---
+title: "Replication of Humayun's Project"
+author: "James Monks"
+date: "07/05/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE) 
+library(spagi)
+library(tidyverse)
+```
+
+## Goal
+To replicate the results found by Humayan in his SPAGI project. That is: based on Hoang data, utilising **3 samples of LEC** expressed genes, and **3 samples of LFC** expressed genes, the number of identified active pathways should be **20,245**
+
+## Analysis of the problem
+The identified pathway number is a result of the function `spagi::identify_active_pathway_path(pathway.path, processed.query.data)`. Hence the arguments `pathway.path` and `processed.query.data` are the only two variables that should have any impact on the number of paths generated.
+
+### Variable: pathway.path 
+The `pathway.path` variable is the background information that describes all of the known possible likely pathways between a receptor protein and a transcription factor protein. This is constructed from lists of receptor, kinase and transcription factor proteins, which are then processed using string-db to find the ppi value of all pairs (where possible). Finally, rules are applied to the protein interaction networks in order to obtain only those that are realistic pathways.
+
+In this sense, the protein lists that are input originally could have an impact on the `pathway.path` object created, and hence the number of pathways generated. 
+
+### Variable: processed.query.data
+The `processed.query.data` variable applies a unique filter to the background pathway information based on the expressed gene profile (list of expressed genes). This takes cell tissue sample data and an expression cutoff threshold. The cell tissue data is the variable that relates to the aforementioned 3 samples of LEC and 3 samples of LFC expressed genes. This data has a large impact on the number of paths that result, as it is used to apply a custom filter on the background total number of paths.
+
+The expression cutoff threshold has been set to 3 (as informed through correspondence), and as such, this number will be used in initial attempts to replicate the given data. There is a potential for this to impact the number of paths however, as it dictates which of the expressed genes are not used (i.e. are not expressed enough).
+
+## Available Data
+### Proteins
+The receptor, kinase and transcription factor protein lists included in the spagi package provide a large list of proteins that can be used in the creation of the background path variables.
+
+The `RKT_Reference.xlsx` also contains lists of these proteins, which are although smaller in number, believed to be associated with the Hoang data.
+
+### Gene Expression
+The `Hoang_Expressed.xlsx` file is being used in these attempts to replicate the results. It is currently unknown how this file breaks down into the characterisation of 3 LEC samples and 3 LFC samples. This will be looked into in the following section.
+
+## Hoang_Expressed.xlsx
+The first two sheets of this data set are the same, with the third sheet 'LF expressed_red' having many more columns that seem to be a variety of identifiers. The second sheet 'LEC expressed' is the easiest to work with as there is no metadata polluting the dataframe when it is being read in. 
+
+The columns Hoang_lec and Hoang_lfc represent samples of lec cells and lfc cells, with the difference column being defined as LFC - LEC. This is then used to generate the higher_expression_in column that can take values of LEC, LFC and common (indicating which sample has a higher expression for each gene type).
+
+The data can be seen below.
+```{r reading-hoang}
+hoang <- readxl::read_excel("data-raw/Hoang_Expressed.xlsx", sheet = "LEC expressed") %>%
+  janitor::clean_names()
+
+hoang %>% 
+  head(50) %>% 
+  DT::datatable()
+```
+
+### Methods of Inquiry
+
+There are a number of ways that this can be applied to get the processed query data needed for the identification of active pathway paths.
+
+1. **Assume that the 3 samples are obtained in each column and apply the preprocessing function directly to obtain the input data.**
+
+2. **Take only those that are expressed or common as the 3 samples for each type (filtering on higher expression column). This is essentially changing the expression threshold value indirectly.**
+
+## Direct Application
+
+In order to directly apply this to the function `spagi::preprocess_querydata()` there is some data transformation that is required. This function requires the data to be in the format of a matrix, with row names as the uppercase gene symbol. This transformation and application is outlined below.
+
+```{r preprocessing}
+processed_data <- hoang %>%
+  select(1:3) %>%
+  as.data.frame() %>%
+  `rownames<-`(toupper(.$gene_symbol)) %>%
+  select(-gene_symbol) %>%
+  as.matrix() %>%
+  preprocess_querydata(exp.cutoff.th = 3)
+
+str(processed_data)
+```
+
+This results in 2 lists (one for each sample type) of named numbers. These numbers represent the expression level of each of the genes that were used as inputs.
+
+### Now Generating Pathways
+Input this variable along with the pathway.path variable to the `spagi::identify_active_pathway_path`
+```{r direct-attempt, cache=FALSE}
+paths <- spagi::identify_active_pathway_path(pathway.path = pathway.path, processed.query.data = processed_data)
+```
+
+Observing the structure of the paths object we have a list for each lec and lfc of varying lengths. The elements of these lists are not paths themselves, but collections of paths starting with a specific receptor protein. This means that the actual pathways can be found 3 levels deep.
+
+```{r path1-structure}
+str(paths, max.level = 1)
+
+paths[[1]][[1]][[1]]
+```
+
+### Number of Pathways
+In order to obtain the number of pathways for each type of sample, and the total, the lists must be flattened in some way. This is shown below, my first mapping the flatten function to each kind of path to strip them of one level, then mapping discard to each of the lists (in order to remove paths that are too long) and finally mapping the length function to count the number of paths in each group. After this, the lists are combined (ensuring to only take the unique paths) to count the total number. 
+
+```{r path-number}
+paths %>% 
+  map(flatten) %>% 
+  map(~discard(.x, ~{
+    length(.x) > 6
+  })) %>% 
+  map(length)
+
+paths %>% 
+  flatten() %>% # Each flatten strips one layer
+  flatten() %>% 
+  discard(~{
+    length(.x) > 6
+  }) %>% 
+  unique() %>% 
+  length()
+```
+
+This gives the numbers LEC: 18015 and LFC: 9557. The lec number is in a similar neighbourhood to that found by Humayan, however, it is too low. The total number of unique paths after they have been combined is found to be 19308 (implying only 1293 paths unique to the lfc sample) which is also short of the target.
+
+## Filtering the Samples
+Another way of inputting this data has been identified as filtering based on the `higher_expression_in` column. The LEC samples will be defined as having a value of either LEC or common and likewise LFC will be defined as having values of LFC or common. These samples will then be combined together (0 being substituted for genes not in one sample, but in the other).
+
+This can be seen as creating a higher expression cutoff threshold, without modifying this number.
+
+This change to the data is seen below.
+```{r}
+modified_hoang <- hoang %>% 
+  mutate(
+    hoang_lec = ifelse(higher_expression_in == "LFC", 0, hoang_lec),
+    hoang_lfc = ifelse(higher_expression_in == "LEC", 0, hoang_lfc)
+  )
+  
+```
+
+Now the same processing and functions are applied.
+```{r processing-modified}
+processed_modified <- modified_hoang %>% 
+  select(1:3) %>%
+  as.data.frame() %>%
+  `rownames<-`(toupper(.$gene_symbol)) %>%
+  select(-gene_symbol) %>%
+  as.matrix() %>%
+  preprocess_querydata(exp.cutoff.th = 3)
+
+```
+
+Generation:
+```{r modified1-attempt, cache=FALSE}
+paths2 <- spagi::identify_active_pathway_path(pathway.path = pathway.path, processed.query.data = processed_modified)
+```
+
+
+Number of Paths:
+```{r modified-path-number}
+paths2 %>% 
+  map(flatten) %>% 
+  map(~discard(.x, ~{
+    length(.x) > 6
+  })) %>% 
+  map(length)
+
+paths2 %>% 
+  flatten() %>% # Each flatten strips one layer
+  flatten() %>% 
+  discard(~{
+    length(.x) > 6
+  }) %>% 
+  unique() %>% 
+  length()
+```
+
+This results in no change to the path numbers. This is because the expression levels defined in the data file would have a cut off less than or equal to 3.
+
+### Using provided cutoffs
+The data file expression levels may have been used in the calculation of the paths in the original project. This process can be performed again relying on the cutoffs defined in the file by setting a very low expression cutoff threshold in the function. This will force only the genes with expression level 0 to be filtered out, which is the flag that was used while modifying the data.
+
+The low cutoff is set to 0.001
+```{r raw-modified-processing}
+processed_modified_raw <- modified_hoang %>% 
+  select(1:3) %>%
+  as.data.frame() %>%
+  `rownames<-`(toupper(.$gene_symbol)) %>%
+  select(-gene_symbol) %>%
+  as.matrix() %>%
+  preprocess_querydata(exp.cutoff.th = 0.001)
+```
+
+Generation:
+```{r raw-generation}
+paths3 <- spagi::identify_active_pathway_path(pathway.path = pathway.path, processed.query.data = processed_modified_raw)
+```
+
+Number of Paths:
+```{r raw-number}
+paths3 %>% 
+  map(flatten) %>% 
+  map(~discard(.x, ~{
+    length(.x) > 6
+  })) %>% 
+  map(length)
+
+paths3 %>% 
+  flatten() %>% # Each flatten strips one layer
+  flatten() %>% 
+  discard(~{
+    length(.x) > 6
+  }) %>% 
+  unique() %>% 
+  length()
+```
+
+These figures are a lot closer to the target, however still fall short in all of lec, lfc and total values. 
+
+## Other approaches
+Other potential approaches that may be worth trying are:
+
+* Using different protein lists (possibly the RKT_Reference.xlsx file)
+* Iterating over the expression threshold
+* Experiment descriptor coercion (based on the ROR1 example yielding a different data structure due to the col-names being the same)
+* Different usage of the current data
+* Sourcing of original data (and methods)
+
+
+## Likely Causes
+The results have consistently fallen short of the original value put forward by Humayan. This could be caused by the expression cutoff being set too high (leading to too many paths dropping out). It could also be caused by the use of the wrong data (data with too few genes or too low of an expression value in some cases). It could also be caused by not having enough pathways to be filtered down in the first place.
